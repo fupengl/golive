@@ -1,0 +1,2 @@
+dev:
+	golive main.go

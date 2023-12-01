@@ -7,8 +7,11 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strings"
+	"syscall"
 	"time"
 
 	"golang.org/x/mod/modfile"
@@ -24,7 +27,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	programPath, _ := filepath.Abs(os.Args[1])
+	mainFile := os.Args[1]
+	programPath, _ := filepath.Abs(mainFile)
 	programArgs := os.Args[2:]
 
 	dirsToWatch, err := findDependencyDirs(programPath)
@@ -48,6 +52,7 @@ func main() {
 			if err != nil {
 				return err
 			}
+
 			return watcher.Add(path)
 		})
 		if err != nil {
@@ -63,10 +68,35 @@ func main() {
 	go watchForChanges(watcher, func() {
 		clearConsole()
 
-		restart(programPath, programArgs...)
+		restart(mainFile, programArgs...)
 	})
 
-	restart(programPath, programArgs...)
+	restart(mainFile, programArgs...)
+
+	interrupt := make(chan os.Signal, 1)
+	signal.Notify(interrupt, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+
+	// Exit gracefully
+	go func() {
+		<-interrupt
+
+		kill()
+
+		if debouncer != nil {
+			debouncer.Stop()
+		}
+
+		watcher.Close()
+
+		os.Exit(0)
+	}()
+
+	// Friendly exit
+	defer func() {
+		if e := recover(); e != nil {
+			log.Fatalf("PANIC: %+v", e)
+		}
+	}()
 
 	// Wait for termination signal
 	select {}
@@ -162,6 +192,11 @@ func watchForChanges(watcher *fsnotify.Watcher, f func()) {
 				continue
 			}
 
+			// Check if the file should be ignored
+			if shouldIgnoreFile(event.Name) {
+				continue
+			}
+
 			if debouncer != nil {
 				debouncer.Stop()
 			}
@@ -179,6 +214,21 @@ func watchForChanges(watcher *fsnotify.Watcher, f func()) {
 	}
 }
 
+func shouldIgnoreFile(filePath string) bool {
+	ignoredFiles := []string{
+		".git", ".vscode", ".idea",
+		".suo", ".ntvs*", ".njsproj", ".sln", ".sw?",
+	}
+
+	for _, ignorePattern := range ignoredFiles {
+		if strings.Contains(filePath, ignorePattern) {
+			return true
+		}
+	}
+
+	return false
+}
+
 var cmd *exec.Cmd
 
 func restart(programPath string, args ...string) {
@@ -186,10 +236,7 @@ func restart(programPath string, args ...string) {
 
 	// Stop the previous process if it's running
 	if running {
-		err := cmd.Process.Kill()
-		if err != nil {
-			log.Println("Error killing previous process:", err)
-		}
+		kill()
 	}
 
 	var execArgs []string
@@ -198,14 +245,20 @@ func restart(programPath string, args ...string) {
 	execArgs = append(execArgs, args...)
 
 	cmd = exec.Command("go", execArgs...)
+
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
 	// Output exec cmd
 	if !running {
 		log.Println("Process starting...")
-		log.Printf("\033[33m > %s\033[0m", cmd.String())
+		log.Printf("\033[33m > go %s\033[0m", strings.Join(execArgs, " "))
 	}
+
+	// Copy the environment variables from the calling process
+	cmd.Env = os.Environ()
 
 	err := cmd.Start()
 	if err != nil {
@@ -214,8 +267,25 @@ func restart(programPath string, args ...string) {
 	}
 
 	if running {
-		log.Println("Process restarted.")
+		log.Printf("Process restarted pid %d.", cmd.Process.Pid)
 	}
+}
+
+func kill() {
+	if cmd == nil {
+		return
+	}
+
+	pid := cmd.Process.Pid
+
+	// https://stackoverflow.com/questions/22470193/why-wont-go-kill-a-child-process-correctly
+	err := syscall.Kill(-pid, syscall.SIGKILL)
+	if err != nil {
+		log.Println("Error killing previous process:", err)
+	}
+
+	// Wait for the previous process to exit
+	_, _ = cmd.Process.Wait()
 }
 
 func clearConsole() {
